@@ -6,34 +6,45 @@ import os
 app = FastAPI()
 
 model = WhisperModel(
-    "distil-large-v3",
-    device="cuda",
-    compute_type="float16"
+    "small.en",
+    device="cpu",
+    compute_type="int8"
 )
 
 @app.websocket("/ws/transcribe")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
 
-    while True:
-        audio_bytes = await websocket.receive_bytes()
+    print("Client connected")
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            tmp.write(audio_bytes)
-            temp_path = tmp.name
+    try:
+        while True:
+            audio_bytes = await websocket.receive_bytes()
 
-        segments, info = model.transcribe(
-            temp_path,
-            beam_size=1
-        )
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                tmp.write(audio_bytes)
+                temp_path = tmp.name
 
-        text = ""
+            segments, info = model.transcribe(
+                temp_path,
+                beam_size=1,
+                vad_filter=True,
+                condition_on_previous_text=False
+            )
 
-        for segment in segments:
-            text += segment.text
+            text = ""
 
-        os.remove(temp_path)
+            for segment in segments:
+                text += segment.text
 
-        await websocket.send_json({
-            "text": text
-        })
+            os.remove(temp_path)
+
+            await websocket.send_json({
+                "text": text.strip()
+            })
+
+    except Exception as e:
+        print("Error:", e)
+
+    finally:
+        print("Client disconnected")
