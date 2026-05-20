@@ -66,11 +66,26 @@ async def broadcast_to_room(room_id: str, payload: dict) -> None:
                 room.viewers.discard(ws)
 
 
-async def transcribe_webm(audio_bytes: bytes) -> str:
+def _audio_suffix(audio_bytes: bytes) -> str:
+    if len(audio_bytes) < 12:
+        return ".webm"
+    if audio_bytes[:4] == b"RIFF":
+        return ".wav"
+    # WebM / Matroska EBML header
+    if audio_bytes[:4] == b"\x1a\x45\xdf\xa3":
+        return ".webm"
+    return ".webm"
+
+
+async def transcribe_audio(audio_bytes: bytes) -> str:
+    if len(audio_bytes) < 200:
+        return ""
+
     temp_path = None
 
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+        suffix = _audio_suffix(audio_bytes)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(audio_bytes)
             temp_path = tmp.name
 
@@ -128,7 +143,7 @@ async def room_websocket(websocket: WebSocket, room_id: str):
                     continue
 
                 try:
-                    text = await transcribe_webm(audio_bytes)
+                    text = await transcribe_audio(audio_bytes)
                     await broadcast_to_room(room_id, {
                         "type": "transcript",
                         "text": text,
@@ -185,7 +200,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             try:
-                text = await transcribe_webm(audio_bytes)
+                text = await transcribe_audio(audio_bytes)
                 await websocket.send_json({"text": text})
             except Exception as e:
                 print("Transcription error:", e)
