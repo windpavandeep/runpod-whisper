@@ -21,7 +21,7 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             audio_bytes = await websocket.receive_bytes()
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
                 tmp.write(audio_bytes)
                 temp_path = tmp.name
 
