@@ -102,6 +102,22 @@ async def transcribe_audio(audio_bytes: bytes) -> str:
             os.remove(temp_path)
 
 
+async def receive_audio_chunk(websocket: WebSocket) -> bytes | None:
+    """Read next message; return audio bytes, empty for ping, None on disconnect."""
+    message = await websocket.receive()
+
+    if message.get("type") == "websocket.disconnect":
+        return None
+
+    if message.get("bytes"):
+        return message["bytes"]
+
+    if message.get("text"):
+        return b""
+
+    return b""
+
+
 @app.post("/rooms")
 async def create_room():
     room_id = str(uuid.uuid4())[:8]
@@ -137,7 +153,10 @@ async def room_websocket(websocket: WebSocket, room_id: str):
             })
 
             while True:
-                audio_bytes = await websocket.receive_bytes()
+                audio_bytes = await receive_audio_chunk(websocket)
+
+                if audio_bytes is None:
+                    break
 
                 if not audio_bytes:
                     continue
@@ -194,7 +213,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            audio_bytes = await websocket.receive_bytes()
+            audio_bytes = await receive_audio_chunk(websocket)
+
+            if audio_bytes is None:
+                break
 
             if not audio_bytes:
                 continue
@@ -206,6 +228,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 print("Transcription error:", e)
                 await websocket.send_json({"text": "", "error": str(e)})
 
+    except WebSocketDisconnect:
+        pass
     except Exception as e:
         print("Connection error:", e)
     finally:
