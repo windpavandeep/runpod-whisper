@@ -1,9 +1,14 @@
+import asyncio
+import traceback
+
 import numpy as np
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from faster_whisper import WhisperModel
 
 app = FastAPI()
+
+WINDOW_BYTES = 16000 * 2 * 2  # ~2 sec of 16 kHz mono int16
 
 print("Loading Whisper model...")
 
@@ -16,52 +21,65 @@ model = WhisperModel(
 print("Whisper model loaded!")
 
 
+def transcribe_window(audio_bytes: bytes) -> str:
+    audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(
+        np.float32
+    ) / 32768.0
+
+    segments, _ = model.transcribe(
+        audio_np,
+        beam_size=1,
+        language="en",
+        vad_filter=True,
+    )
+
+    return " ".join(segment.text for segment in segments).strip()
+
+
 @app.websocket("/ws/transcribe")
 async def websocket_endpoint(websocket: WebSocket):
 
     await websocket.accept()
+    print("Client connected")
 
     audio_buffer = b""
 
     try:
-
         while True:
+            message = await websocket.receive()
 
-            chunk = await websocket.receive_bytes()
+            if message["type"] == "websocket.disconnect":
+                break
 
+            if "bytes" not in message:
+                continue
+
+            chunk = message["bytes"]
+            print("received bytes:", len(chunk))
             audio_buffer += chunk
 
-            # ~2 seconds of 16 kHz mono int16 PCM
-            if len(audio_buffer) >= 16000 * 2 * 2:
+            if len(audio_buffer) < WINDOW_BYTES:
+                continue
 
-                audio_np = np.frombuffer(
-                    audio_buffer,
-                    dtype=np.int16,
-                ).astype(np.float32) / 32768.0
+            window = audio_buffer[:WINDOW_BYTES]
+            audio_buffer = audio_buffer[WINDOW_BYTES:]
 
-                segments, _ = model.transcribe(
-                    audio_np,
-                    beam_size=1,
-                    language="en",
-                    vad_filter=True,
-                )
+            try:
+                text = await asyncio.to_thread(transcribe_window, window)
+                if text:
+                    print("transcript:", text)
+                    await websocket.send_json({"text": text})
+            except Exception:
+                print("Transcribe error:")
+                traceback.print_exc()
+                # Keep connection alive; skip bad window
 
-                text = ""
+    except WebSocketDisconnect as exc:
+        print(f"Client disconnected (code={exc.code})")
 
-                for segment in segments:
-                    text += segment.text + " "
-
-                if text.strip():
-                    await websocket.send_json({
-                        "text": text.strip(),
-                    })
-
-                audio_buffer = b""
-
-    except Exception as e:
-
-        print(e)
+    except Exception:
+        print("WebSocket handler error:")
+        traceback.print_exc()
 
     finally:
-
-        print("client disconnected")
+        print("connection closed")
