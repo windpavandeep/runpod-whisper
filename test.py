@@ -1,9 +1,17 @@
 from faster_whisper import WhisperModel
 
 model = WhisperModel(
-    "small.en",
-    device="cpu",
-    compute_type="int8"
+    "medium",
+    device="cuda",
+    compute_type="float16"
 )
 
-print("Whisper Loaded Successfully")
+segments, info = model.transcribe(
+    "audio.mp3",
+    beam_size=5
+)
+
+print("Detected language:", info.language)
+
+for segment in segments:
+    print(segment.text)
