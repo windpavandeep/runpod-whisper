@@ -95,6 +95,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif "bytes" in message:
 
+                print("received bytes:", len(message["bytes"]))
+
                 audio_chunks.append(message["bytes"])
 
     except Exception as e:
