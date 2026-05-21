@@ -8,7 +8,7 @@ app = FastAPI()
 print("Loading Whisper model...")
 
 model = WhisperModel(
-    "small",
+    "tiny.en",
     device="cuda",
     compute_type="float16",
 )
@@ -29,20 +29,21 @@ async def websocket_endpoint(websocket: WebSocket):
 
             chunk = await websocket.receive_bytes()
 
-            print("received bytes:", len(chunk))
-
             audio_buffer += chunk
 
-            if len(audio_buffer) > 32000 * 5:
+            # ~2 seconds of 16 kHz mono int16 PCM
+            if len(audio_buffer) >= 16000 * 2 * 2:
 
                 audio_np = np.frombuffer(
                     audio_buffer,
                     dtype=np.int16,
                 ).astype(np.float32) / 32768.0
 
-                segments, info = model.transcribe(
+                segments, _ = model.transcribe(
                     audio_np,
+                    beam_size=1,
                     language="en",
+                    vad_filter=True,
                 )
 
                 text = ""
@@ -50,9 +51,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 for segment in segments:
                     text += segment.text + " "
 
-                await websocket.send_json({
-                    "text": text.strip(),
-                })
+                if text.strip():
+                    await websocket.send_json({
+                        "text": text.strip(),
+                    })
 
                 audio_buffer = b""
 
