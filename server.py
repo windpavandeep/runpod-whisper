@@ -35,7 +35,13 @@ async def websocket_endpoint(websocket: WebSocket):
 
         while True:
 
-            message = await websocket.receive()
+            try:
+
+                message = await websocket.receive()
+
+            except Exception:
+
+                break
 
             if "text" in message:
 
