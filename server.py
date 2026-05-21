@@ -1,6 +1,4 @@
-import os
-import uuid
-import subprocess
+import numpy as np
 
 from fastapi import FastAPI, WebSocket
 from faster_whisper import WhisperModel
@@ -12,14 +10,10 @@ print("Loading Whisper model...")
 model = WhisperModel(
     "small",
     device="cuda",
-    compute_type="float16"
+    compute_type="float16",
 )
 
 print("Whisper model loaded!")
-
-TEMP_DIR = "temp_audio"
-
-os.makedirs(TEMP_DIR, exist_ok=True)
 
 
 @app.websocket("/ws/transcribe")
@@ -27,82 +21,45 @@ async def websocket_endpoint(websocket: WebSocket):
 
     await websocket.accept()
 
-    print("Client connected")
-
-    audio_chunks = []
+    audio_buffer = b""
 
     try:
 
         while True:
 
-            try:
+            chunk = await websocket.receive_bytes()
 
-                message = await websocket.receive()
+            print("received bytes:", len(chunk))
 
-            except Exception:
+            audio_buffer += chunk
 
-                break
+            if len(audio_buffer) > 32000 * 5:
 
-            if "text" in message:
+                audio_np = np.frombuffer(
+                    audio_buffer,
+                    dtype=np.int16,
+                ).astype(np.float32) / 32768.0
 
-                if message["text"] == "END":
+                segments, info = model.transcribe(
+                    audio_np,
+                    language="en",
+                )
 
-                    webm_path = f"{TEMP_DIR}/{uuid.uuid4()}.webm"
+                text = ""
 
-                    wav_path = f"{TEMP_DIR}/{uuid.uuid4()}.wav"
+                for segment in segments:
+                    text += segment.text + " "
 
-                    with open(webm_path, "wb") as f:
-                        for chunk in audio_chunks:
-                            f.write(chunk)
+                await websocket.send_json({
+                    "text": text.strip(),
+                })
 
-                    command = [
-                        "ffmpeg",
-                        "-i",
-                        webm_path,
-                        "-ar",
-                        "16000",
-                        "-ac",
-                        "1",
-                        wav_path,
-                        "-y"
-                    ]
-
-                    subprocess.run(
-                        command,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
-
-                    segments, info = model.transcribe(
-                        wav_path,
-                        beam_size=5
-                    )
-
-                    transcript = ""
-
-                    for segment in segments:
-                        transcript += segment.text + " "
-
-                    await websocket.send_json({
-                        "text": transcript.strip(),
-                        "language": info.language
-                    })
-
-                    os.remove(webm_path)
-                    os.remove(wav_path)
-
-                    audio_chunks = []
-
-            elif "bytes" in message:
-
-                print("received bytes:", len(message["bytes"]))
-
-                audio_chunks.append(message["bytes"])
+                audio_buffer = b""
 
     except Exception as e:
 
-        print("ERROR:", e)
+        print(e)
 
     finally:
 
-        print("Client disconnected")
+        print("client disconnected")
