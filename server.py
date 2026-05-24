@@ -1,54 +1,82 @@
 import asyncio
-import struct
+import os
+import tempfile
 import traceback
+from typing import Any
 
-import numpy as np
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
+
+MODEL_NAME = "large-v3"
+DEVICE = "cuda"
+COMPUTE_TYPE = "float16"
 
 app = FastAPI()
 
-print("Loading Whisper model...")
-
-model = WhisperModel(
-    "small.en",
-    device="cuda",
-    compute_type="float16",
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-print("Whisper model loaded!")
+print(f"Loading Whisper model {MODEL_NAME} on {DEVICE}…")
+model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
+print("Whisper model loaded.")
 
 
-def transcribe_chunk(audio_bytes: bytes) -> str:
+def _audio_suffix(audio_bytes: bytes) -> str:
+    if len(audio_bytes) >= 12 and audio_bytes[:4] == b"RIFF":
+        return ".wav"
+    if len(audio_bytes) >= 4 and audio_bytes[:4] == b"\x1a\x45\xdf\xa3":
+        return ".webm"
+    return ".wav"
+
+
+def transcribe_full_audio(audio_bytes: bytes) -> dict[str, Any]:
     if len(audio_bytes) < 1600:
-        return ""
+        return {"transcript": "", "segments": []}
 
-    audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(
-        np.float32
-    ) / 32768.0
+    temp_path = None
+    try:
+        suffix = _audio_suffix(audio_bytes)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(audio_bytes)
+            temp_path = tmp.name
 
-    segments, _ = model.transcribe(
-        audio_np,
-        beam_size=1,
-        language="en",
-        vad_filter=True,
-    )
+        segments_iter, _info = model.transcribe(
+            temp_path,
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=True,
+        )
 
-    return " ".join(segment.text for segment in segments).strip()
+        segments: list[dict[str, Any]] = []
+        parts: list[str] = []
+        for index, seg in enumerate(segments_iter):
+            text = seg.text.strip()
+            if not text:
+                continue
+            parts.append(text)
+            segments.append(
+                {
+                    "id": f"seg-{index}",
+                    "startMs": int(seg.start * 1000),
+                    "endMs": int(seg.end * 1000),
+                    "text": text,
+                    "speakerIndex": 0,
+                }
+            )
 
-
-def parse_chunk_message(data: bytes) -> tuple[int, bytes]:
-    if len(data) < 5:
-        raise ValueError("Chunk too short")
-
-    chunk_id = struct.unpack(">I", data[:4])[0]
-    audio = data[4:]
-    return chunk_id, audio
+        return {"transcript": " ".join(parts).strip(), "segments": segments}
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
 async def safe_send_json(websocket: WebSocket, payload: dict) -> bool:
-    """Return False if the client already closed the socket."""
     try:
         await websocket.send_json(payload)
         return True
@@ -56,56 +84,71 @@ async def safe_send_json(websocket: WebSocket, payload: dict) -> bool:
         return False
 
 
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok", "model": MODEL_NAME}
+
+
+@app.post("/transcribe/full")
+async def transcribe_full(file: UploadFile = File(...)) -> dict[str, Any]:
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        return {"transcript": "", "segments": []}
+
+    try:
+        result = await asyncio.to_thread(transcribe_full_audio, audio_bytes)
+        print(
+            f"Full transcribe: {len(audio_bytes)} bytes -> "
+            f"{len(result.get('segments', []))} segments"
+        )
+        return result
+    except Exception:
+        traceback.print_exc()
+        return {"error": "Transcription failed", "transcript": "", "segments": []}
+
+
+# Legacy realtime chunk socket (optional; not used by hybrid frontend)
 @app.websocket("/ws/transcribe")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket) -> None:
+    import struct
 
     await websocket.accept()
-    print("Client connected")
+    print("Client connected (legacy chunk WS)")
 
     try:
         while True:
             message = await websocket.receive()
-
             if message["type"] == "websocket.disconnect":
                 break
-
             if "bytes" not in message:
                 continue
 
             raw = message["bytes"]
-
-            try:
-                chunk_id, audio = parse_chunk_message(raw)
-            except ValueError as exc:
-                print("Invalid chunk:", exc)
+            if len(raw) < 5:
                 continue
 
+            chunk_id = struct.unpack(">I", raw[:4])[0]
+            audio = raw[4:]
             print(f"chunk {chunk_id}: {len(audio)} bytes")
 
             try:
-                text = await asyncio.to_thread(transcribe_chunk, audio)
+                audio_np = (
+                    __import__("numpy")
+                    .frombuffer(audio, dtype="int16")
+                    .astype(__import__("numpy").float32)
+                    / 32768.0
+                )
+                segments, _ = model.transcribe(
+                    audio_np, beam_size=1, language="en", vad_filter=True
+                )
+                text = " ".join(s.text for s in segments).strip()
+                if text:
+                    await safe_send_json(
+                        websocket, {"chunkId": chunk_id, "text": text}
+                    )
             except Exception:
-                print(f"Transcribe error (chunk {chunk_id}):")
                 traceback.print_exc()
-                continue
-
-            if not text:
-                continue
-
-            print(f"chunk {chunk_id} transcript:", text)
-            if not await safe_send_json(
-                websocket,
-                {"chunkId": chunk_id, "text": text},
-            ):
-                print(f"Client gone before chunk {chunk_id} reply was sent")
-                break
-
-    except WebSocketDisconnect as exc:
-        print(f"Client disconnected (code={exc.code})")
-
-    except Exception:
-        print("WebSocket handler error:")
-        traceback.print_exc()
-
+    except WebSocketDisconnect:
+        pass
     finally:
         print("connection closed")
