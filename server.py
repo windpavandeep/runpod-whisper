@@ -26,6 +26,9 @@ print(f"Loading Whisper model {MODEL_NAME} on {DEVICE}…")
 model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
 print("Whisper model loaded.")
 
+# Must match frontend WHISPER_WS_CHUNK_SEC
+CHUNK_DURATION_MS = 5_000
+
 
 def _audio_suffix(audio_bytes: bytes) -> str:
     if len(audio_bytes) >= 12 and audio_bytes[:4] == b"RIFF":
@@ -99,6 +102,34 @@ def transcribe_full_audio(audio_bytes: bytes) -> dict[str, Any]:
     return transcribe_audio_bytes(audio_bytes, time_offset_ms=0, chunk_index=0)
 
 
+def transcribe_pcm_int16(
+    pcm_bytes: bytes,
+    *,
+    time_offset_ms: int = 0,
+    chunk_index: int = 0,
+) -> dict[str, Any]:
+    if len(pcm_bytes) < 1600:
+        return {"transcript": "", "segments": []}
+
+    import numpy as np
+
+    audio_np = (
+        np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    )
+    segments_iter, _info = model.transcribe(
+        audio_np,
+        beam_size=5,
+        vad_filter=True,
+        condition_on_previous_text=True,
+    )
+    return _segments_from_whisper(
+        segments_iter,
+        time_offset_ms=time_offset_ms,
+        id_prefix=f"chunk-{chunk_index}",
+        speaker_index=chunk_index % 2,
+    )
+
+
 async def safe_send_json(websocket: WebSocket, payload: dict) -> bool:
     try:
         await websocket.send_json(payload)
@@ -163,13 +194,12 @@ async def transcribe_full(file: UploadFile = File(...)) -> dict[str, Any]:
         return {"error": "Transcription failed", "transcript": "", "segments": []}
 
 
-# Legacy realtime chunk socket (optional; not used by hybrid frontend)
 @app.websocket("/ws/transcribe")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     import struct
 
     await websocket.accept()
-    print("Client connected (legacy chunk WS)")
+    print("Client connected (realtime chunk WS)")
 
     try:
         while True:
@@ -185,23 +215,27 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
             chunk_id = struct.unpack(">I", raw[:4])[0]
             audio = raw[4:]
-            print(f"chunk {chunk_id}: {len(audio)} bytes")
+            if len(audio) < 1600:
+                continue
+
+            chunk_index = max(0, chunk_id - 1)
+            start_ms = chunk_index * CHUNK_DURATION_MS
+            print(f"chunk {chunk_id} @ {start_ms}ms: {len(audio)} bytes")
 
             try:
-                audio_np = (
-                    __import__("numpy")
-                    .frombuffer(audio, dtype="int16")
-                    .astype(__import__("numpy").float32)
-                    / 32768.0
+                result = await asyncio.to_thread(
+                    transcribe_pcm_int16,
+                    audio,
+                    time_offset_ms=start_ms,
+                    chunk_index=chunk_index,
                 )
-                segments, _ = model.transcribe(
-                    audio_np, beam_size=1, language="en", vad_filter=True
-                )
-                text = " ".join(s.text for s in segments).strip()
-                if text:
-                    await safe_send_json(
-                        websocket, {"chunkId": chunk_id, "text": text}
-                    )
+                payload = {
+                    "chunkId": chunk_id,
+                    "transcript": result.get("transcript", ""),
+                    "segments": result.get("segments", []),
+                }
+                if not await safe_send_json(websocket, payload):
+                    break
             except Exception:
                 traceback.print_exc()
     except WebSocketDisconnect:
