@@ -138,6 +138,16 @@ async def safe_send_json(websocket: WebSocket, payload: dict) -> bool:
         return False
 
 
+@app.get("/")
+async def root() -> dict[str, str]:
+    return {
+        "service": "printx-whisper",
+        "health": "/health",
+        "websocket": "/ws/transcribe",
+        "note": "Use WebSocket only on /ws/transcribe — browser HTTP GET here causes uvicorn warnings.",
+    }
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "model": MODEL_NAME}
