@@ -4,7 +4,7 @@ import tempfile
 import traceback
 from typing import Any
 
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 
@@ -35,7 +35,38 @@ def _audio_suffix(audio_bytes: bytes) -> str:
     return ".wav"
 
 
-def transcribe_full_audio(audio_bytes: bytes) -> dict[str, Any]:
+def _segments_from_whisper(
+    segments_iter: Any,
+    *,
+    time_offset_ms: int = 0,
+    id_prefix: str = "seg",
+    speaker_index: int = 0,
+) -> dict[str, Any]:
+    segments: list[dict[str, Any]] = []
+    parts: list[str] = []
+    for index, seg in enumerate(segments_iter):
+        text = seg.text.strip()
+        if not text:
+            continue
+        parts.append(text)
+        segments.append(
+            {
+                "id": f"{id_prefix}-{index}",
+                "startMs": int(seg.start * 1000) + time_offset_ms,
+                "endMs": int(seg.end * 1000) + time_offset_ms,
+                "text": text,
+                "speakerIndex": speaker_index,
+            }
+        )
+    return {"transcript": " ".join(parts).strip(), "segments": segments}
+
+
+def transcribe_audio_bytes(
+    audio_bytes: bytes,
+    *,
+    time_offset_ms: int = 0,
+    chunk_index: int = 0,
+) -> dict[str, Any]:
     if len(audio_bytes) < 1600:
         return {"transcript": "", "segments": []}
 
@@ -53,27 +84,19 @@ def transcribe_full_audio(audio_bytes: bytes) -> dict[str, Any]:
             condition_on_previous_text=True,
         )
 
-        segments: list[dict[str, Any]] = []
-        parts: list[str] = []
-        for index, seg in enumerate(segments_iter):
-            text = seg.text.strip()
-            if not text:
-                continue
-            parts.append(text)
-            segments.append(
-                {
-                    "id": f"seg-{index}",
-                    "startMs": int(seg.start * 1000),
-                    "endMs": int(seg.end * 1000),
-                    "text": text,
-                    "speakerIndex": 0,
-                }
-            )
-
-        return {"transcript": " ".join(parts).strip(), "segments": segments}
+        return _segments_from_whisper(
+            segments_iter,
+            time_offset_ms=time_offset_ms,
+            id_prefix=f"chunk-{chunk_index}",
+            speaker_index=chunk_index % 2,
+        )
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
+
+
+def transcribe_full_audio(audio_bytes: bytes) -> dict[str, Any]:
+    return transcribe_audio_bytes(audio_bytes, time_offset_ms=0, chunk_index=0)
 
 
 async def safe_send_json(websocket: WebSocket, payload: dict) -> bool:
@@ -87,6 +110,39 @@ async def safe_send_json(websocket: WebSocket, payload: dict) -> bool:
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "model": MODEL_NAME}
+
+
+@app.post("/transcribe/chunk")
+async def transcribe_chunk(
+    file: UploadFile = File(...),
+    chunk_index: int = Form(0),
+    start_ms: int = Form(0),
+) -> dict[str, Any]:
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        return {"transcript": "", "segments": [], "chunkIndex": chunk_index}
+
+    try:
+        result = await asyncio.to_thread(
+            transcribe_audio_bytes,
+            audio_bytes,
+            time_offset_ms=max(0, start_ms),
+            chunk_index=max(0, chunk_index),
+        )
+        print(
+            f"Chunk {chunk_index} @ {start_ms}ms: {len(audio_bytes)} bytes -> "
+            f"{len(result.get('segments', []))} segments"
+        )
+        result["chunkIndex"] = chunk_index
+        return result
+    except Exception:
+        traceback.print_exc()
+        return {
+            "error": "Transcription failed",
+            "transcript": "",
+            "segments": [],
+            "chunkIndex": chunk_index,
+        }
 
 
 @app.post("/transcribe/full")
