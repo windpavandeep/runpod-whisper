@@ -47,6 +47,15 @@ def parse_chunk_message(data: bytes) -> tuple[int, bytes]:
     return chunk_id, audio
 
 
+async def safe_send_json(websocket: WebSocket, payload: dict) -> bool:
+    """Return False if the client already closed the socket."""
+    try:
+        await websocket.send_json(payload)
+        return True
+    except WebSocketDisconnect:
+        return False
+
+
 @app.websocket("/ws/transcribe")
 async def websocket_endpoint(websocket: WebSocket):
 
@@ -75,15 +84,21 @@ async def websocket_endpoint(websocket: WebSocket):
 
             try:
                 text = await asyncio.to_thread(transcribe_chunk, audio)
-                if text:
-                    print(f"chunk {chunk_id} transcript:", text)
-                    await websocket.send_json({
-                        "chunkId": chunk_id,
-                        "text": text,
-                    })
             except Exception:
                 print(f"Transcribe error (chunk {chunk_id}):")
                 traceback.print_exc()
+                continue
+
+            if not text:
+                continue
+
+            print(f"chunk {chunk_id} transcript:", text)
+            if not await safe_send_json(
+                websocket,
+                {"chunkId": chunk_id, "text": text},
+            ):
+                print(f"Client gone before chunk {chunk_id} reply was sent")
+                break
 
     except WebSocketDisconnect as exc:
         print(f"Client disconnected (code={exc.code})")
