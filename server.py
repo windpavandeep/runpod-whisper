@@ -30,12 +30,49 @@ print("Whisper model loaded.")
 CHUNK_DURATION_MS = 5_000
 
 
-def _audio_suffix(audio_bytes: bytes) -> str:
-    if len(audio_bytes) >= 12 and audio_bytes[:4] == b"RIFF":
-        return ".wav"
-    if len(audio_bytes) >= 4 and audio_bytes[:4] == b"\x1a\x45\xdf\xa3":
-        return ".webm"
-    return ".wav"
+def _is_wav(audio_bytes: bytes) -> bool:
+    return (
+        len(audio_bytes) >= 12
+        and audio_bytes[:4] == b"RIFF"
+        and audio_bytes[8:12] == b"WAVE"
+    )
+
+
+def _is_webm(audio_bytes: bytes) -> bool:
+    return len(audio_bytes) >= 4 and audio_bytes[:4] == b"\x1a\x45\xdf\xa3"
+
+
+def _is_raw_pcm_int16(audio_bytes: bytes) -> bool:
+    """WebSocket chunks are raw int16 LE @ 16 kHz — not a container file."""
+    if len(audio_bytes) < 1600 or len(audio_bytes) % 2 != 0:
+        return False
+    if _is_wav(audio_bytes) or _is_webm(audio_bytes):
+        return False
+    return True
+
+
+def _pcm_int16_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = 16_000) -> bytes:
+    import struct
+
+    num_samples = len(pcm_bytes) // 2
+    data_size = num_samples * 2
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + data_size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,
+        1,
+        sample_rate,
+        sample_rate * 2,
+        2,
+        16,
+        b"data",
+        data_size,
+    )
+    return header + pcm_bytes
 
 
 def _segments_from_whisper(
@@ -73,11 +110,28 @@ def transcribe_audio_bytes(
     if len(audio_bytes) < 1600:
         return {"transcript": "", "segments": []}
 
+    # Raw PCM from WebSocket must not be saved as .webm/.wav without a header
+    if _is_raw_pcm_int16(audio_bytes):
+        return transcribe_pcm_int16(
+            audio_bytes,
+            time_offset_ms=time_offset_ms,
+            chunk_index=chunk_index,
+        )
+
     temp_path = None
     try:
-        suffix = _audio_suffix(audio_bytes)
+        if _is_wav(audio_bytes):
+            file_bytes = audio_bytes
+            suffix = ".wav"
+        elif _is_webm(audio_bytes):
+            file_bytes = audio_bytes
+            suffix = ".webm"
+        else:
+            file_bytes = _pcm_int16_to_wav_bytes(audio_bytes)
+            suffix = ".wav"
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(audio_bytes)
+            tmp.write(file_bytes)
             temp_path = tmp.name
 
         segments_iter, _info = model.transcribe(
@@ -246,8 +300,17 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 }
                 if not await safe_send_json(websocket, payload):
                     break
-            except Exception:
+            except Exception as exc:
                 traceback.print_exc()
+                await safe_send_json(
+                    websocket,
+                    {
+                        "chunkId": chunk_id,
+                        "error": str(exc),
+                        "transcript": "",
+                        "segments": [],
+                    },
+                )
     except WebSocketDisconnect:
         pass
     finally:
