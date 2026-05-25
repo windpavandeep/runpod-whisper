@@ -183,11 +183,14 @@ def transcribe_pcm(
 
             transcript_parts.append(text)
 
+            chunk_index = max(0, chunk_id - 1)
+            start_ms = chunk_index * CHUNK_DURATION_MS
             segments.append({
-                "id": f"{chunk_id}-{index}",
-                "start": seg.start,
-                "end": seg.end,
+                "id": f"chunk-{chunk_id}-{index}",
+                "startMs": int(seg.start * 1000) + start_ms,
+                "endMs": int(seg.end * 1000) + start_ms,
                 "text": text,
+                "speakerIndex": 0,
             })
 
         return {
@@ -355,7 +358,7 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
 
     uvicorn.run(
-        "server:app",
+        "whisper_socket:app",
         host="0.0.0.0",
         port=8000,
         reload=False,

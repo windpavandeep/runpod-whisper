@@ -20,12 +20,23 @@ export WHISPER_TEMP_AUDIO_DIR=/root/runpod-whisper/temp_audio
 
 Default without env: `{repo}/runpod-whisper/temp_audio` next to `server.py`.
 
+## Run (do not use `socket:app` — conflicts with Python stdlib `socket`)
+
+```bash
+cd /root/runpod-whisper
+uvicorn whisper_socket:app --host 0.0.0.0 --port 8000
+```
+
+Or: `python whisper_socket.py`
+
 ## Restart service
 
 ```bash
 sudo systemctl restart whisper
 journalctl -u whisper -f
 ```
+
+systemd `ExecStart` should use `whisper_socket:app`, not `socket:app`.
 
 ## What to look for in logs
 
