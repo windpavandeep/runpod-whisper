@@ -117,8 +117,16 @@ def pcm_to_wav_bytes(pcm_bytes: bytes) -> bytes:
     return header + pcm_bytes
 
 
+def _looks_like_webm(data: bytes) -> bool:
+    """EBML header — indicates MediaRecorder/webm was sent instead of PCM."""
+    return len(data) >= 4 and data[:4] == b"\x1a\x45\xdf\xa3"
+
+
 def parse_pcm_frame(data: bytes):
     if len(data) < 8:
+        return None
+
+    if _looks_like_webm(data[4:]) or _looks_like_webm(data):
         return None
 
     chunk_id = int.from_bytes(data[:4], "big")
@@ -182,6 +190,10 @@ async def root():
         "service": "whisper-realtime",
         "version": SERVER_VERSION,
         "device": DEVICE,
+        "websocket": "/ws/transcribe",
+        "protocol": "binary [uint32 BE chunkId][int16 PCM 16kHz mono] → in-memory WAV → whisper",
+        "chunk_duration_ms": CHUNK_DURATION_MS,
+        "note": "WebSocket path does not use ffmpeg; do not send MediaRecorder webm fragments.",
     }
 
 
@@ -192,6 +204,8 @@ async def health():
         "device": DEVICE,
         "model": MODEL_NAME,
         "version": SERVER_VERSION,
+        "protocol": "pcm-ws",
+        "chunk_duration_ms": CHUNK_DURATION_MS,
     }
 
 
@@ -257,10 +271,21 @@ async def websocket_endpoint(websocket: WebSocket):
             parsed = parse_pcm_frame(data)
 
             if parsed is None:
+                hint = (
+                    "Invalid PCM frame. Expected [4-byte chunkId][int16 PCM]. "
+                    "Do not send MediaRecorder webm blobs."
+                )
+                if _looks_like_webm(data):
+                    hint = (
+                        "Received WebM/EBML data, not PCM. "
+                        "Deploy the AudioWorklet frontend and server "
+                        f"{SERVER_VERSION}."
+                    )
                 await safe_send_json(
                     websocket,
                     {
-                        "error": "Invalid PCM frame",
+                        "chunkId": 0,
+                        "error": hint,
                         "transcript": "",
                         "segments": [],
                     },
@@ -345,3 +370,7 @@ if __name__ == "__main__":
         port=8080,
         reload=False,
     )
+    
+    
+    
+    
