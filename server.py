@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import struct
-import subprocess
 import tempfile
 import traceback
 import uuid
@@ -12,7 +11,7 @@ from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 
-SERVER_VERSION = "2026-03-24-webm-merge"
+SERVER_VERSION = "2026-03-24-pcm-wav-ws"
 
 MODEL_NAME = "large-v3"
 DEVICE = "cuda"
@@ -20,8 +19,8 @@ COMPUTE_TYPE = "float16"
 
 SAMPLE_RATE = 16_000
 
-# Must match frontend MEDIA_RECORDER_CHUNK_MS / WHISPER_WS_CHUNK_SEC
-CHUNK_DURATION_MS = 2_000
+# Must match frontend WHISPER_WS_CHUNK_SEC
+CHUNK_DURATION_MS = 3_000
 
 app = FastAPI()
 
@@ -76,6 +75,19 @@ def _pcm_int16_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = SAMPLE_RATE) ->
     return header + pcm_bytes
 
 
+def _parse_pcm_ws_frame(data: bytes) -> tuple[int, bytes] | None:
+    """Binary frame: [4-byte BE chunkId][int16 PCM little-endian]."""
+    if len(data) < 8:
+        return None
+    chunk_id = int.from_bytes(data[:4], byteorder="big", signed=False)
+    pcm = data[4:]
+    if len(pcm) % 2 != 0:
+        pcm = pcm[:-1]
+    if len(pcm) < 2:
+        return None
+    return chunk_id, pcm
+
+
 def _segments_from_whisper(
     segments_iter: Any,
     *,
@@ -117,45 +129,33 @@ def _transcribe_wav_file(
     )
 
 
-def _webm_to_wav(webm_path: str, wav_path: str) -> None:
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            webm_path,
-            "-ar",
-            str(SAMPLE_RATE),
-            "-ac",
-            "1",
-            wav_path,
-        ],
-        check=True,
-        capture_output=True,
-        timeout=120,
-    )
-
-
-def _transcribe_merged_webm(
-    webm_path: str,
-    wav_path: str,
+def _transcribe_pcm_bytes(
+    pcm_bytes: bytes,
     *,
-    chunk_index: int,
-    start_ms: int,
+    chunk_id: int,
 ) -> dict[str, Any]:
-    if not os.path.exists(webm_path) or os.path.getsize(webm_path) < 200:
+    min_bytes = SAMPLE_RATE * 2 // 2
+    if len(pcm_bytes) < min_bytes:
         return {"transcript": "", "segments": []}
 
+    chunk_index = max(0, chunk_id - 1)
+    start_ms = chunk_index * CHUNK_DURATION_MS
+    wav_bytes = _pcm_int16_to_wav_bytes(pcm_bytes)
+
+    temp_path: str | None = None
     try:
-        _webm_to_wav(webm_path, wav_path)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(wav_bytes)
+            temp_path = tmp.name
+
         return _transcribe_wav_file(
-            wav_path,
+            temp_path,
             time_offset_ms=start_ms,
             chunk_index=chunk_index,
         )
-    except subprocess.CalledProcessError as exc:
-        err = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else str(exc)
-        raise RuntimeError(f"ffmpeg failed: {err}") from exc
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
 def _transcribe_uploaded_bytes(
@@ -167,7 +167,7 @@ def _transcribe_uploaded_bytes(
     if len(audio_bytes) < 1600:
         return {"transcript": "", "segments": []}
 
-    temp_path = None
+    temp_path: str | None = None
     try:
         if _is_wav(audio_bytes):
             file_bytes = audio_bytes
@@ -203,7 +203,7 @@ async def root() -> dict[str, str]:
         "version": SERVER_VERSION,
         "health": "/health",
         "websocket": "/ws/transcribe",
-        "protocol": "MediaRecorder webm fragments appended → ffmpeg → whisper",
+        "protocol": "binary [uint32 BE chunkId][int16 PCM] → WAV per chunk → whisper",
     }
 
 
@@ -258,15 +258,7 @@ async def transcribe_full(file: UploadFile = File(...)) -> dict[str, Any]:
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     session_id = uuid.uuid4().hex[:12]
-    webm_path = os.path.join(tempfile.gettempdir(), f"printx_{session_id}.webm")
-    wav_path = os.path.join(tempfile.gettempdir(), f"printx_{session_id}.wav")
-    chunk_id = 0
-
     print(f"WS connected ({SERVER_VERSION}) session={session_id}")
-
-    for path in (webm_path, wav_path):
-        if os.path.exists(path):
-            os.remove(path)
 
     try:
         while True:
@@ -281,54 +273,35 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 except json.JSONDecodeError:
                     meta = {}
                 if meta.get("type") == "end":
-                    chunk_id += 1
-                    start_ms = (chunk_id - 1) * CHUNK_DURATION_MS
-                    try:
-                        result = await asyncio.to_thread(
-                            _transcribe_merged_webm,
-                            webm_path,
-                            wav_path,
-                            chunk_index=chunk_id - 1,
-                            start_ms=start_ms,
-                        )
-                        await safe_send_json(
-                            websocket,
-                            {
-                                "chunkId": chunk_id,
-                                "transcript": result.get("transcript", ""),
-                                "segments": result.get("segments", []),
-                            },
-                        )
-                    except Exception as exc:
-                        traceback.print_exc()
-                        await safe_send_json(
-                            websocket,
-                            {"chunkId": chunk_id, "error": str(exc), "transcript": "", "segments": []},
-                        )
-                continue
+                    continue
 
             if "bytes" not in message:
                 continue
 
             data = message["bytes"]
-            if len(data) < 1:
+            parsed = _parse_pcm_ws_frame(data)
+            if parsed is None:
+                await safe_send_json(
+                    websocket,
+                    {
+                        "error": (
+                            "Invalid PCM frame. Expected [4-byte chunkId][int16 PCM]. "
+                            "Do not send WebM fragments — redeploy this server and refresh the app."
+                        ),
+                        "transcript": "",
+                        "segments": [],
+                    },
+                )
                 continue
 
-            with open(webm_path, "ab") as f:
-                f.write(data)
-
-            chunk_id += 1
-            chunk_index = chunk_id - 1
-            start_ms = chunk_index * CHUNK_DURATION_MS
-            print(f"chunk {chunk_id}: appended {len(data)} bytes → {webm_path}")
+            chunk_id, pcm_bytes = parsed
+            print(f"chunk {chunk_id}: {len(pcm_bytes)} pcm bytes")
 
             try:
                 result = await asyncio.to_thread(
-                    _transcribe_merged_webm,
-                    webm_path,
-                    wav_path,
-                    chunk_index=chunk_index,
-                    start_ms=start_ms,
+                    _transcribe_pcm_bytes,
+                    pcm_bytes,
+                    chunk_id=chunk_id,
                 )
                 if not await safe_send_json(
                     websocket,
@@ -355,10 +328,4 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
-        for path in (webm_path, wav_path):
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
         print(f"WS closed session={session_id}")
