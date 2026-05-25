@@ -1,5 +1,6 @@
 import asyncio
 import os
+import struct
 import tempfile
 import traceback
 from typing import Any
@@ -8,9 +9,13 @@ from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 
+SERVER_VERSION = "2026-03-24-wav-pcm"
+
 MODEL_NAME = "large-v3"
 DEVICE = "cuda"
 COMPUTE_TYPE = "float16"
+
+SAMPLE_RATE = 16_000
 
 app = FastAPI()
 
@@ -22,12 +27,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-print(f"Loading Whisper model {MODEL_NAME} on {DEVICE}…")
+print(f"Loading Whisper model {MODEL_NAME} on {DEVICE}… ({SERVER_VERSION})")
 model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
 print("Whisper model loaded.")
 
 # Must match frontend WHISPER_WS_CHUNK_SEC
 CHUNK_DURATION_MS = 5_000
+
+WHISPER_OPTS = {
+    "beam_size": 5,
+    "vad_filter": True,
+    "condition_on_previous_text": True,
+}
 
 
 def _is_wav(audio_bytes: bytes) -> bool:
@@ -38,22 +49,10 @@ def _is_wav(audio_bytes: bytes) -> bool:
     )
 
 
-def _is_webm(audio_bytes: bytes) -> bool:
-    return len(audio_bytes) >= 4 and audio_bytes[:4] == b"\x1a\x45\xdf\xa3"
-
-
-def _is_raw_pcm_int16(audio_bytes: bytes) -> bool:
-    """WebSocket chunks are raw int16 LE @ 16 kHz — not a container file."""
-    if len(audio_bytes) < 1600 or len(audio_bytes) % 2 != 0:
-        return False
-    if _is_wav(audio_bytes) or _is_webm(audio_bytes):
-        return False
-    return True
-
-
-def _pcm_int16_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = 16_000) -> bytes:
-    import struct
-
+def _pcm_int16_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
+    """Wrap raw int16 LE mono PCM in a valid WAV container for ffmpeg."""
+    if len(pcm_bytes) % 2 != 0:
+        pcm_bytes = pcm_bytes[:-1]
     num_samples = len(pcm_bytes) // 2
     data_size = num_samples * 2
     header = struct.pack(
@@ -101,59 +100,50 @@ def _segments_from_whisper(
     return {"transcript": " ".join(parts).strip(), "segments": segments}
 
 
-def transcribe_audio_bytes(
+def _transcribe_wav_file(
+    wav_path: str,
+    *,
+    time_offset_ms: int = 0,
+    chunk_index: int = 0,
+) -> dict[str, Any]:
+    segments_iter, _info = model.transcribe(wav_path, **WHISPER_OPTS)
+    return _segments_from_whisper(
+        segments_iter,
+        time_offset_ms=time_offset_ms,
+        id_prefix=f"chunk-{chunk_index}",
+        speaker_index=chunk_index % 2,
+    )
+
+
+def _transcribe_bytes_as_wav(
     audio_bytes: bytes,
     *,
     time_offset_ms: int = 0,
     chunk_index: int = 0,
 ) -> dict[str, Any]:
+    """Always write a .wav temp file — never .webm (av fails on mis-detected PCM)."""
     if len(audio_bytes) < 1600:
         return {"transcript": "", "segments": []}
 
-    # Raw PCM from WebSocket must not be saved as .webm/.wav without a header
-    if _is_raw_pcm_int16(audio_bytes):
-        return transcribe_pcm_int16(
-            audio_bytes,
-            time_offset_ms=time_offset_ms,
-            chunk_index=chunk_index,
-        )
+    if _is_wav(audio_bytes):
+        file_bytes = audio_bytes
+    else:
+        # WebSocket PCM, mis-tagged uploads, etc.
+        file_bytes = _pcm_int16_to_wav_bytes(audio_bytes)
 
     temp_path = None
     try:
-        if _is_wav(audio_bytes):
-            file_bytes = audio_bytes
-            suffix = ".wav"
-        elif _is_webm(audio_bytes):
-            file_bytes = audio_bytes
-            suffix = ".webm"
-        else:
-            file_bytes = _pcm_int16_to_wav_bytes(audio_bytes)
-            suffix = ".wav"
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
             tmp.write(file_bytes)
             temp_path = tmp.name
-
-        segments_iter, _info = model.transcribe(
+        return _transcribe_wav_file(
             temp_path,
-            beam_size=5,
-            vad_filter=True,
-            condition_on_previous_text=True,
-        )
-
-        return _segments_from_whisper(
-            segments_iter,
             time_offset_ms=time_offset_ms,
-            id_prefix=f"chunk-{chunk_index}",
-            speaker_index=chunk_index % 2,
+            chunk_index=chunk_index,
         )
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
-
-
-def transcribe_full_audio(audio_bytes: bytes) -> dict[str, Any]:
-    return transcribe_audio_bytes(audio_bytes, time_offset_ms=0, chunk_index=0)
 
 
 def transcribe_pcm_int16(
@@ -162,26 +152,28 @@ def transcribe_pcm_int16(
     time_offset_ms: int = 0,
     chunk_index: int = 0,
 ) -> dict[str, Any]:
-    if len(pcm_bytes) < 1600:
-        return {"transcript": "", "segments": []}
-
-    import numpy as np
-
-    audio_np = (
-        np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-    )
-    segments_iter, _info = model.transcribe(
-        audio_np,
-        beam_size=5,
-        vad_filter=True,
-        condition_on_previous_text=True,
-    )
-    return _segments_from_whisper(
-        segments_iter,
+    return _transcribe_bytes_as_wav(
+        pcm_bytes,
         time_offset_ms=time_offset_ms,
-        id_prefix=f"chunk-{chunk_index}",
-        speaker_index=chunk_index % 2,
+        chunk_index=chunk_index,
     )
+
+
+def transcribe_audio_bytes(
+    audio_bytes: bytes,
+    *,
+    time_offset_ms: int = 0,
+    chunk_index: int = 0,
+) -> dict[str, Any]:
+    return _transcribe_bytes_as_wav(
+        audio_bytes,
+        time_offset_ms=time_offset_ms,
+        chunk_index=chunk_index,
+    )
+
+
+def transcribe_full_audio(audio_bytes: bytes) -> dict[str, Any]:
+    return transcribe_audio_bytes(audio_bytes, time_offset_ms=0, chunk_index=0)
 
 
 async def safe_send_json(websocket: WebSocket, payload: dict) -> bool:
@@ -196,15 +188,15 @@ async def safe_send_json(websocket: WebSocket, payload: dict) -> bool:
 async def root() -> dict[str, str]:
     return {
         "service": "printx-whisper",
+        "version": SERVER_VERSION,
         "health": "/health",
         "websocket": "/ws/transcribe",
-        "note": "Use WebSocket only on /ws/transcribe — browser HTTP GET here causes uvicorn warnings.",
     }
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok", "model": MODEL_NAME}
+    return {"status": "ok", "model": MODEL_NAME, "version": SERVER_VERSION}
 
 
 @app.post("/transcribe/chunk")
@@ -230,10 +222,10 @@ async def transcribe_chunk(
         )
         result["chunkIndex"] = chunk_index
         return result
-    except Exception:
+    except Exception as exc:
         traceback.print_exc()
         return {
-            "error": "Transcription failed",
+            "error": str(exc),
             "transcript": "",
             "segments": [],
             "chunkIndex": chunk_index,
@@ -253,9 +245,9 @@ async def transcribe_full(file: UploadFile = File(...)) -> dict[str, Any]:
             f"{len(result.get('segments', []))} segments"
         )
         return result
-    except Exception:
+    except Exception as exc:
         traceback.print_exc()
-        return {"error": "Transcription failed", "transcript": "", "segments": []}
+        return {"error": str(exc), "transcript": "", "segments": []}
 
 
 @app.websocket("/ws/transcribe")
@@ -263,7 +255,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     import struct
 
     await websocket.accept()
-    print("Client connected (realtime chunk WS)")
+    print(f"Client connected (WS {SERVER_VERSION})")
 
     try:
         while True:
@@ -284,7 +276,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
             chunk_index = max(0, chunk_id - 1)
             start_ms = chunk_index * CHUNK_DURATION_MS
-            print(f"chunk {chunk_id} @ {start_ms}ms: {len(audio)} bytes")
+            print(
+                f"chunk {chunk_id} @ {start_ms}ms: {len(audio)} bytes "
+                f"(pcm, wrap wav)"
+            )
 
             try:
                 result = await asyncio.to_thread(
