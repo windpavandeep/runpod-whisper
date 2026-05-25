@@ -1,20 +1,28 @@
 import asyncio
-import json
 import os
 import struct
-import tempfile
+import subprocess
 import traceback
 import uuid
-import subprocess
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 
-SERVER_VERSION = "2026-05-26-realtime-fixed"
+SERVER_VERSION = "2026-05-26-temp-audio-dir"
 
 MODEL_NAME = "large-v3"
+
+# Dedicated temp dir (override on RunPod: WHISPER_TEMP_AUDIO_DIR=/root/runpod-whisper/temp_audio)
+_DEFAULT_TEMP_DIR = Path(__file__).resolve().parent / "temp_audio"
+TEMP_AUDIO_DIR = Path(
+    os.environ.get("WHISPER_TEMP_AUDIO_DIR", str(_DEFAULT_TEMP_DIR)),
+).resolve()
+
+SAMPLE_RATE = 16000
+CHUNK_DURATION_MS = 3000
 
 # CUDA fallback support
 try:
@@ -36,9 +44,6 @@ except Exception:
     )
     print("CPU fallback model loaded")
 
-SAMPLE_RATE = 16000
-CHUNK_DURATION_MS = 3000
-
 app = FastAPI()
 
 app.add_middleware(
@@ -56,6 +61,43 @@ WHISPER_OPTS = {
 }
 
 
+def ensure_temp_audio_dir() -> Path:
+    """Create project temp folder (avoid /tmp permission/sandbox issues)."""
+    TEMP_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(TEMP_AUDIO_DIR, 0o777)
+    return TEMP_AUDIO_DIR
+
+
+def _temp_wav_path() -> str:
+    return str(TEMP_AUDIO_DIR / f"{uuid.uuid4().hex}.wav")
+
+
+def _temp_upload_path(suffix: str) -> str:
+    safe_suffix = suffix if suffix.startswith(".") else f".{suffix}"
+    return str(TEMP_AUDIO_DIR / f"{uuid.uuid4().hex}{safe_suffix}")
+
+
+def _log_temp_file(path: str, *, chunk_id: int | None = None) -> int:
+    size = os.path.getsize(path) if os.path.exists(path) else 0
+    label = f"chunk {chunk_id}" if chunk_id is not None else "upload"
+    print(f"TEMP PATH ({label}): {path}")
+    print(f"FILE SIZE ({label}): {size}")
+    if size < 50_000:
+        print(
+            f"WARNING ({label}): small WAV ({size} bytes) — "
+            "expect ~96000+ for 3s PCM; frontend data may be broken.",
+        )
+    return size
+
+
+def _remove_temp(path: str | None) -> None:
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError as exc:
+            print(f"TEMP cleanup failed {path}: {exc}")
+
+
 def _is_wav(audio_bytes: bytes) -> bool:
     return (
         len(audio_bytes) >= 12
@@ -65,7 +107,8 @@ def _is_wav(audio_bytes: bytes) -> bool:
 
 
 def convert_to_wav(input_path: str) -> str:
-    output_path = f"{input_path}.wav"
+    base = os.path.basename(input_path)
+    output_path = str(TEMP_AUDIO_DIR / f"{base}.wav")
 
     command = [
         "ffmpeg",
@@ -144,7 +187,11 @@ def transcribe_file(
     chunk_index: int = 0,
     time_offset_ms: int = 0,
 ):
-    segments_iter, info = model.transcribe(
+    size = _log_temp_file(path, chunk_id=chunk_index)
+    if size < 44:
+        raise ValueError(f"WAV file too small to transcribe: {size} bytes")
+
+    segments_iter, _info = model.transcribe(
         path,
         **WHISPER_OPTS,
     )
@@ -184,21 +231,33 @@ async def safe_send_json(websocket: WebSocket, payload: dict):
         return False
 
 
+@app.on_event("startup")
+async def startup() -> None:
+    path = ensure_temp_audio_dir()
+    print(f"TEMP_AUDIO_DIR: {path} (writable: {os.access(path, os.W_OK)})")
+    tmp_stat = os.stat("/tmp") if os.path.exists("/tmp") else None
+    if tmp_stat:
+        mode = oct(tmp_stat.st_mode)[-4:]
+        sticky = bool(tmp_stat.st_mode & 0o1000)
+        print(f"/tmp mode={mode} sticky={'yes' if sticky else 'NO (expected t in drwxrwxrwt)'}")
+
+
 @app.get("/")
 async def root():
     return {
         "service": "whisper-realtime",
         "version": SERVER_VERSION,
         "device": DEVICE,
+        "temp_audio_dir": str(TEMP_AUDIO_DIR),
         "websocket": "/ws/transcribe",
-        "protocol": "binary [uint32 BE chunkId][int16 PCM 16kHz mono] → in-memory WAV → whisper",
+        "protocol": "binary [uint32 BE chunkId][int16 PCM 16kHz mono] → WAV in temp_audio → whisper",
         "chunk_duration_ms": CHUNK_DURATION_MS,
-        "note": "WebSocket path does not use ffmpeg; do not send MediaRecorder webm fragments.",
     }
 
 
 @app.get("/health")
 async def health():
+    ensure_temp_audio_dir()
     return {
         "status": "ok",
         "device": DEVICE,
@@ -206,25 +265,27 @@ async def health():
         "version": SERVER_VERSION,
         "protocol": "pcm-ws",
         "chunk_duration_ms": CHUNK_DURATION_MS,
+        "temp_audio_dir": str(TEMP_AUDIO_DIR),
+        "temp_dir_writable": os.access(TEMP_AUDIO_DIR, os.W_OK),
     }
 
 
 @app.post("/transcribe/full")
 async def transcribe_full(file: UploadFile = File(...)):
-    temp_input = None
-    temp_wav = None
+    temp_input: str | None = None
+    temp_wav: str | None = None
 
     try:
         audio_bytes = await file.read()
+        suffix = Path(file.filename or "upload.bin").suffix or ".bin"
+        temp_input = _temp_upload_path(suffix)
 
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=file.filename,
-        ) as tmp:
+        with open(temp_input, "wb") as tmp:
             tmp.write(audio_bytes)
-            temp_input = tmp.name
 
+        _log_temp_file(temp_input)
         temp_wav = convert_to_wav(temp_input)
+        _log_temp_file(temp_wav)
 
         result = await asyncio.to_thread(
             transcribe_file,
@@ -243,9 +304,8 @@ async def transcribe_full(file: UploadFile = File(...)):
         }
 
     finally:
-        for path in [temp_input, temp_wav]:
-            if path and os.path.exists(path):
-                os.remove(path)
+        _remove_temp(temp_input)
+        _remove_temp(temp_wav)
 
 
 @app.websocket("/ws/transcribe")
@@ -301,16 +361,13 @@ async def websocket_endpoint(websocket: WebSocket):
             start_ms = chunk_index * CHUNK_DURATION_MS
 
             wav_bytes = pcm_to_wav_bytes(pcm_bytes)
-
-            temp_path = None
+            temp_path = _temp_wav_path()
 
             try:
-                with tempfile.NamedTemporaryFile(
-                    delete=False,
-                    suffix=".wav",
-                ) as tmp:
+                with open(temp_path, "wb") as tmp:
                     tmp.write(wav_bytes)
-                    temp_path = tmp.name
+
+                _log_temp_file(temp_path, chunk_id=chunk_id)
 
                 result = await asyncio.to_thread(
                     transcribe_file,
@@ -348,8 +405,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     break
 
             finally:
-                if temp_path and os.path.exists(temp_path):
-                    os.remove(temp_path)
+                _remove_temp(temp_path)
 
     except WebSocketDisconnect:
         print(f"WS disconnected {session_id}")
@@ -364,13 +420,10 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
 
+    ensure_temp_audio_dir()
     uvicorn.run(
-        "main:app",
+        "server:app",
         host="0.0.0.0",
         port=8080,
         reload=False,
     )
-    
-    
-    
-    

@@ -1,7 +1,4 @@
-# Environments
+temp_audio/
+__pycache__/
+*.pyc
 .env
-.env.*
-.venv/
-venv/
-ENV/
-env/
